@@ -44,6 +44,7 @@ func Run(opt *common.Options) {
 	handler.HTTPProxy.OnRequest().DoFunc(handler.onRequest)
 	handler.HTTPProxy.OnRequest().HandleConnectFunc(handler.onConnect)
 	handler.HTTPProxy.OnResponse().DoFunc(handler.onResponse)
+	handler.HTTPProxy.ConnectDialWithReq = handler.connectDial
 	handler.HTTPProxy.NonproxyHandler = http.HandlerFunc(nonProxy)
 	handler.Gateways = make(map[string]*proxygateway.ProxyGateway)
 

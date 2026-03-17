@@ -7,7 +7,9 @@ LABEL repository="https://github.com/mubeng/mubeng"
 LABEL maintainer="dwisiswant0"
 
 WORKDIR /app
+ENV GOPROXY=https://goproxy.cn,direct
 COPY ./go.mod .
+COPY ./go.sum .
 RUN go mod download
 
 COPY . .

@@ -1,11 +1,15 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
+
 	mubengerrors "github.com/mubeng/mubeng/common/errors"
 	"io"
 	"net/http"
@@ -18,6 +22,7 @@ import (
 	"github.com/mubeng/mubeng/internal/proxygateway"
 	"github.com/mubeng/mubeng/pkg/helper/awsurl"
 	"github.com/mubeng/mubeng/pkg/mubeng"
+	"h12.io/socks"
 )
 
 // onRequest handles client request
@@ -91,6 +96,26 @@ func (p *Proxy) onRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Reque
 					return
 				}
 			}
+
+			// Treat proxy auth failures (407/403) as proxy errors and rotate
+			if p.Options.RotateOnErr && (resp.StatusCode == http.StatusProxyAuthRequired || resp.StatusCode == http.StatusForbidden) {
+				resp.Body.Close()
+
+				log.Warnf(
+					"%s Proxy %s returned %d, rotating to next proxy",
+					r.RemoteAddr, proxy, resp.StatusCode,
+				)
+
+				if p.Options.RemoveOnErr {
+					p.removeProxy(proxy)
+				}
+
+				if i < p.Options.MaxErrors || p.Options.MaxErrors <= 0 {
+					i++
+					continue
+				}
+			}
+
 			defer resp.Body.Close()
 
 			buf, err := io.ReadAll(resp.Body)
@@ -149,7 +174,7 @@ func (p *Proxy) onConnect(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectA
 		}
 	}
 
-	return goproxy.MitmConnect, host
+	return goproxy.OkConnect, host
 }
 
 // onResponse handles backend responses, and removing hop-by-hop headers
@@ -316,4 +341,84 @@ func nonProxy(w http.ResponseWriter, req *http.Request) {
 
 func serverErr(req *http.Request) *http.Response {
 	return goproxy.NewResponse(req, mime, http.StatusBadGateway, "Proxy server error")
+}
+
+// connectDial handles CONNECT tunneling through upstream proxies.
+// This allows HTTPS traffic to pass through without MITM, keeping TLS end-to-end.
+func (p *Proxy) connectDial(req *http.Request, network, addr string) (net.Conn, error) {
+	log.Debugf("%s CONNECT %s", req.RemoteAddr, addr)
+
+	i := 0
+	for {
+		proxy := p.rotateProxy()
+
+		conn, err := p.dialViaProxy(proxy, network, addr)
+		if err != nil {
+			log.Errorf("%s CONNECT via %s failed: %s", req.RemoteAddr, proxy, err)
+
+			if p.Options.RemoveOnErr {
+				p.removeProxy(proxy)
+			}
+
+			if p.Options.RotateOnErr && (i < p.Options.MaxErrors || p.Options.MaxErrors <= 0) {
+				i++
+				continue
+			}
+			return nil, err
+		}
+
+		return conn, nil
+	}
+}
+
+func (p *Proxy) dialViaProxy(proxyAddr, network, addr string) (net.Conn, error) {
+	proxyURL, err := url.Parse(proxyAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	switch proxyURL.Scheme {
+	case "http", "https":
+		return p.connectViaHTTPProxy(proxyURL, addr)
+	case "socks4", "socks4a", "socks5":
+		dialFunc := socks.Dial(proxyAddr)
+		return dialFunc(network, addr)
+	default:
+		return nil, fmt.Errorf("unsupported proxy scheme for CONNECT: %s", proxyURL.Scheme)
+	}
+}
+
+func (p *Proxy) connectViaHTTPProxy(proxyURL *url.URL, addr string) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", proxyURL.Host, p.Options.Timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	reqStr := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", addr, addr)
+	if proxyURL.User != nil {
+		auth := proxyURL.User.String()
+		basicAuth := base64.StdEncoding.EncodeToString([]byte(auth))
+		reqStr += fmt.Sprintf("Proxy-Authorization: Basic %s\r\n", basicAuth)
+	}
+	reqStr += "\r\n"
+
+	_, err = conn.Write([]byte(reqStr))
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: "CONNECT"})
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		conn.Close()
+		return nil, fmt.Errorf("proxy CONNECT failed: %s", resp.Status)
+	}
+	resp.Body.Close()
+
+	return conn, nil
 }
